@@ -107,8 +107,23 @@ IMPORTANT:
       });
       
       if (previousToolCalls.length > 0) {
-        console.log("Warning: Multiple tool calls detected");
-        // Let the agent handle the error
+        console.log("Warning: Multiple tool calls detected, forcing 'done' call");
+        // Force the agent to call 'done' by modifying the result
+        result.output = [
+          {
+            type: 'tool_call',
+            role: 'assistant',
+            stop_reason: 'tool',
+            tools: [{
+              type: 'tool',
+              id: `toolu_${Date.now()}`,
+              name: 'done',
+              input: {
+                answer: "I've already attempted to convert the agreement. Please check the previous response."
+              }
+            }]
+          }
+        ];
         return result;
       }
       
@@ -178,7 +193,14 @@ const apaiAgentFunction = inngest.createFunction(
     event: "apai/request"
   },
   async ({ event }) => {
-    return APAIAgent.run(event.data.input);
+    return APAIAgent.run(event.data.input, {
+      model: anthropic({
+        model: "claude-3-5-sonnet-20240620",
+        defaultParameters: {
+          max_tokens: 1000,
+        },
+      })
+    });
   }
 );
 
