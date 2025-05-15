@@ -1,13 +1,16 @@
 import "dotenv/config";
 import { anthropic, createAgent, createNetwork, createTool } from "@inngest/agent-kit";
 import { createServer } from "@inngest/agent-kit/server";
-import { Inngest } from "inngest";
+import { Inngest, type EventPayload } from "inngest";
 import { z } from "zod";
-import { type ToolCallMessage, type Tool } from "@inngest/agent-kit";
+import { type ToolCallMessage, type Tool, type MCP } from "@inngest/agent-kit";
 // import { type StateData } from "@inngest/agent-kit/src/state";
 // import express from "express";
 
 const apaiUrl = "http://localhost:9000/sse";
+
+// In-memory de-duplication store
+const seenEventIds = new Set<string>();
 
 // 1) idempotent MCP-backed tool for getAgreement
 const getAgreementTool = createTool({
@@ -16,7 +19,6 @@ const getAgreementTool = createTool({
   parameters: z.object({
     agreementId: z.string().describe("ID of the agreement to fetch"),
   }),
-  // note the context now includes `step`
   handler: async (
     { agreementId },
     { step }  // destructure step from the context
@@ -39,7 +41,7 @@ const getAgreementTool = createTool({
     },
     tool: { name: "getAgreement" },
   },
-});
+} as Tool.Any);
 
 const getTemplateTool = createTool({
   name: "apai-getTemplate",
@@ -58,7 +60,7 @@ const getTemplateTool = createTool({
     // no-op stub
     return { success: true };
   },
-});
+} as Tool.Any);
 
 // 2) your done tool can also be guarded if needed (often not necessary)
 const done = createTool({
@@ -97,7 +99,17 @@ IMPORTANT:
 8. Make no assumptions about the data structure - analyze what you receive from the tools
 9. Focus on answering the user's specific question using the data you gather`,
   tools: [getAgreementTool, getTemplateTool, done],
-  mcpServers: [{ name: "apai", transport: { type: "sse", url: apaiUrl } }]
+  mcpServers: [{ name: "apai", transport: { type: "sse", url: apaiUrl } }],
+  lifecycle: {
+    onFinish: async ({ result }) => {
+      const last = result.toolCalls[result.toolCalls.length - 1];
+      if (last?.tool?.name === "done") {
+        console.log("🔴 onFinish: done tool returned → stopping network");
+        return result;
+      }
+      return result;
+    }
+  }
 });
 
 const apaiAgentNetwork = createNetwork({
@@ -113,23 +125,57 @@ export const apaiAgentFunction = inngestClient.createFunction(
     id: "apai-agent",         // this must match the Console function ID
     name: "APAI Agent",
     retries: 0,
-    concurrency: 1,
-    idempotency: "event._inngest.gid"
+    concurrency: 1
+    // idempotencyKey: ({ event }) => event._inngest?.gid
   },
   { event: "apai/request" },
   async ({ event }) => {
     console.log("apaiAgentFunction invoked with:", event.data.input);
+    const eid = event.id;
+    if (eid && seenEventIds.has(eid)) {
+      console.log("🔁 Duplicate invocation for", eid, "— skipping entirely");
+      return;              // bail out BEFORE calling network.run()
+    }
+    if (eid) seenEventIds.add(eid);
+
+    console.log("🔥 Primary invocation for", eid);
+    
+    // const networkRun = await apaiAgentNetwork.run(event.data.input);
+    // const inference = networkRun.state.results[networkRun.state.results.length - 1];
+    // console.log("🦾 Agent output:", inference.output);
+    // // Find the `done` tool_call in the final output
+    // const doneCall = inference.output?.find(
+    //   m => m.type === "tool_call" && m.tools?.[0]?.name === "done"
+    // ) as ToolCallMessage | undefined;
+    // if (doneCall) {
+    //   console.log("✅ Done call answer:", doneCall.tools[0].input.answer);
+    //   // Unwrap and return just the answer string
+    //   return { answer: doneCall.tools[0].input.answer };
+    // }
+
     const networkRun = await apaiAgentNetwork.run(event.data.input);
-    const inference = networkRun.state.results[networkRun.state.results.length - 1];
+    const inference  = networkRun.state.results.at(-1)!;
     console.log("🦾 Agent output:", inference.output);
-    // Find the `done` tool_call in the final output
+
+    // If we've already responded for this GID, skip returning a second time
+    // if (gid && seenEventGIDs.has(gid)) {
+    //   console.log("🔁 Already returned for this GID — skipping");
+    //   return;
+    // }
+    // if (gid) {
+    //   seenEventGIDs.add(gid);
+    // }
+
+    // Find done
     const doneCall = inference.output?.find(
       m => m.type === "tool_call" && m.tools?.[0]?.name === "done"
     ) as ToolCallMessage | undefined;
+
     if (doneCall) {
-      console.log("✅ Done call answer:", doneCall.tools[0].input.answer);
-      // Unwrap and return just the answer string
-      return { answer: doneCall.tools[0].input.answer };
+      const answer = doneCall.tools[0].input.answer;
+      console.log("✅ Returning answer:", answer);
+      return { answer };
+      // return { answer, stop: true };  // stop the network
     }
 
     // Fallback: return whatever text the agent emitted
@@ -154,10 +200,9 @@ export const apaiAgentFunction = inngestClient.createFunction(
 // });
 
 const server = createServer({
-  
   networks: [apaiAgentNetwork],
   appId: "apai-agent-network",
-  functions:  [apaiAgentFunction]
+  functions: [apaiAgentFunction as any]
 });
 
 server.listen(3010, () => console.log("Listening on :3010"));
