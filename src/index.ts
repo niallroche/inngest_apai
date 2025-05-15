@@ -1,9 +1,10 @@
 import "dotenv/config";
-import { anthropic, createAgent, createNetwork, createTool } from "@inngest/agent-kit";
+import { anthropic, createAgent, createNetwork, createTool, StateData } from "@inngest/agent-kit";
 import { createServer } from "@inngest/agent-kit/server";
 import { Inngest, type EventPayload } from "inngest";
 import { z } from "zod";
 import { type ToolCallMessage, type Tool, type MCP } from "@inngest/agent-kit";
+
 // import { type StateData } from "@inngest/agent-kit/src/state";
 // import express from "express";
 
@@ -11,6 +12,7 @@ const apaiUrl = "http://localhost:9000/sse";
 
 // In-memory de-duplication store
 const seenEventIds = new Set<string>();
+const runPromises = new Map<string, Promise<any>>();
 
 // 1) idempotent MCP-backed tool for getAgreement
 const getAgreementTool = createTool({
@@ -101,10 +103,10 @@ IMPORTANT:
   tools: [getAgreementTool, getTemplateTool, done],
   mcpServers: [{ name: "apai", transport: { type: "sse", url: apaiUrl } }],
   lifecycle: {
-    onFinish: async ({ result }) => {
+    onResponse: async ({ result }) => {
       const last = result.toolCalls[result.toolCalls.length - 1];
       if (last?.tool?.name === "done") {
-        console.log("🔴 onFinish: done tool returned → stopping network");
+        console.log("🔴 onResponse: saw done → stopping network");
         return result;
       }
       return result;
@@ -132,13 +134,17 @@ export const apaiAgentFunction = inngestClient.createFunction(
   async ({ event }) => {
     console.log("apaiAgentFunction invoked with:", event.data.input);
     const eid = event.id;
-    if (eid && seenEventIds.has(eid)) {
-      console.log("🔁 Duplicate invocation for", eid, "— skipping entirely");
-      return;              // bail out BEFORE calling network.run()
-    }
-    if (eid) seenEventIds.add(eid);
+    if (!eid) throw new Error("Missing event.id");
 
-    console.log("🔥 Primary invocation for", eid);
+    // If no network.run() started yet for this eid, start one and store its promise
+    if (!runPromises.has(eid)) {
+      console.log("🔥 Starting network.run() for", eid);
+      const p = apaiAgentNetwork.run(event.data.input);
+      runPromises.set(eid, p);
+    }
+
+    // Await the shared promise so we only resolve once the agent calls done
+    const runResult = await runPromises.get(eid)!;
     
     // const networkRun = await apaiAgentNetwork.run(event.data.input);
     // const inference = networkRun.state.results[networkRun.state.results.length - 1];
@@ -157,6 +163,10 @@ export const apaiAgentFunction = inngestClient.createFunction(
     const inference  = networkRun.state.results.at(-1)!;
     console.log("🦾 Agent output:", inference.output);
 
+    // On the very first invocation, return the answer
+    if (!seenEventIds.has(eid)) {
+      seenEventIds.add(eid);
+
     // If we've already responded for this GID, skip returning a second time
     // if (gid && seenEventGIDs.has(gid)) {
     //   console.log("🔁 Already returned for this GID — skipping");
@@ -166,24 +176,29 @@ export const apaiAgentFunction = inngestClient.createFunction(
     //   seenEventGIDs.add(gid);
     // }
 
-    // Find done
-    const doneCall = inference.output?.find(
-      m => m.type === "tool_call" && m.tools?.[0]?.name === "done"
-    ) as ToolCallMessage | undefined;
+      // Find done
+      const doneCall = inference.output?.find(
+        m => m.type === "tool_call" && m.tools?.[0]?.name === "done"
+      ) as ToolCallMessage | undefined;
 
-    if (doneCall) {
-      const answer = doneCall.tools[0].input.answer;
-      console.log("✅ Returning answer:", answer);
-      return { answer };
-      // return { answer, stop: true };  // stop the network
+      if (doneCall) {
+        const answer = doneCall.tools[0].input.answer;
+        console.log("✅ Returning answer:", answer);
+        return { answer };
+        // return { answer, stop: true };  // stop the network
+      }
+
+      // Fallback: return whatever text the agent emitted
+      const texts = inference.output
+        ?.filter(m => m.type === "text")
+        .map(m => m.content)
+        .join("\n");
+      return { answer: texts || "No answer generated." };
     }
 
-    // Fallback: return whatever text the agent emitted
-    const texts = inference.output
-      ?.filter(m => m.type === "text")
-      .map(m => m.content)
-      .join("\n");
-    return { answer: texts || "No answer generated." };
+    // All other parallel attempts simply return undefined after waiting
+    console.log("🔁 Duplicate for", eid, "— already returned");
+    return;
     // console.log("🦾 Agent output:", lastResult?.output);
     // console.log("All done:", lastResult?.output);
     // return lastResult;
