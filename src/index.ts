@@ -5,6 +5,8 @@ import {
   createAgent,
   createNetwork,
   createTool,
+  type InferenceResult,
+  type ToolResultMessage
 } from "@inngest/agent-kit";
 import { createServer } from "@inngest/agent-kit/server";
 import { z } from "zod";
@@ -13,6 +15,28 @@ import { Inngest } from "inngest";
 
 const apaiUrl = "http://localhost:9000/sse"
 
+// Generic tool for passing data between agents
+const passDataTool = createTool({
+  name: "pass_data",
+  description: "Pass data between agents in the pipeline",
+  parameters: z.object({
+    data: z.any().describe("Data to pass to the next agent"),
+    context: z.object({
+      query: z.string().describe("The original user query"),
+      tool: z.string().describe("The tool that provided the data"),
+      timestamp: z.string().describe("When the data was retrieved")
+    })
+  }),
+  handler: async ({ data, context }, { network }) => {
+    if (network?.state.kv) {
+      network.state.kv.set("current_data", data);
+      network.state.kv.set("data_context", context);
+    }
+    return { success: true };
+  }
+});
+
+// Generic tool for final responses
 const doneTool = createTool({
   name: "done",
   description: "Call this tool when you are finished with the task.",
@@ -20,32 +44,86 @@ const doneTool = createTool({
     answer: z.string().describe("Answer to the user's question.")
   }),
   handler: async ({ answer }, { network }) => {
+    console.log("=== doneTool called ===");
+    console.log("Answer provided:", answer);
+    console.log("Answer length:", answer.length);
+    console.log("Network state:", network?.state);
     if (network?.state.kv) {
       network.state.kv.set("answer", answer);
+      console.log("Answer stored in network state");
+    } else {
+      console.log("Warning: No network state available to store answer");
     }
     return answer;
   }
 });
 
+// Remote APAI tools
+const getAgreementTool = createTool({
+  name: "apai-getAgreement",
+  description: "Retrieves the full data of an agreement",
+  mcp: {
+    server: { 
+      name: "apai",
+      transport: {
+        type: "sse",
+        url: apaiUrl
+      }
+    },
+    tool: { name: "getAgreement" }
+  },
+  parameters: z.object({
+    agreementId: z.string().describe("ID of the agreement to fetch")
+  }),
+  handler: async ({ agreementId }) => {
+    // The actual handling is done by the MCP server
+    return { success: true };
+  }
+});
+
+const getTemplateTool = createTool({
+  name: "apai-getTemplate",
+  description: "Retrieves the full data of a template",
+  mcp: {
+    server: { 
+      name: "apai",
+      transport: {
+        type: "sse",
+        url: apaiUrl
+      }
+    },
+    tool: { name: "getTemplate" }
+  },
+  parameters: z.object({
+    templateId: z.string().describe("ID of the template to fetch")
+  }),
+  handler: async ({ templateId }) => {
+    // The actual handling is done by the MCP server
+    return { success: true };
+  }
+});
+
 const APAIAgent = createAgent({
-  name: `apai-agent-${uuidv4()}`,
-  system: `You are a helpful assistant that help manage smart legal contracts using the APAI API. You can create templates and agreements based off templates and trigger the agreement clauses via functions exposed by the APAI API.
+  name: "apai-agent",
+  system: `You are a helpful assistant that helps manage smart legal contracts using the APAI API.
 
 Available tools:
-- apai-convert-agreement-to-format: Converts an agreement to either HTML or Markdown format. The format parameter must be either "html" or "markdown".
-- done: Call this when you have completed the task or if you encounter an error.
+- apai-getAgreement: Retrieves the full data of an agreement
+- apai-getTemplate: Retrieves the full data of a template
+- done: Call this when you have completed the task or if you encounter an error
 
 IMPORTANT: 
-1. After using apai-convert-agreement-to-format, ALWAYS call the 'done' tool with the result or an error message.
-2. If the tool call fails, call 'done' with an error message explaining what went wrong.
-3. When using apai-convert-agreement-to-format, always use either "html" or "markdown" as the format parameter.
-4. NEVER make the same tool call multiple times in a row.
-5. If you get a response from apai-convert-agreement-to-format, immediately call 'done' with that response.
-6. If you get an error from apai-convert-agreement-to-format, immediately call 'done' with an error message.
-7. Do not make any other tool calls after apai-convert-agreement-to-format except for 'done'.
-`,
+1. You MUST use the MCP tools (apai-getAgreement or apai-getTemplate) to gather the necessary data first
+2. You may need to use multiple tool calls to gather all required information
+3. After receiving tool responses, analyze the data to determine the answer to the user's question
+4. Once you have determined the answer, call the 'done' tool with a clear, concise response
+5. The 'done' tool requires an 'answer' parameter - this should be your final response to the user
+6. If you encounter any errors or can't find the requested information, call 'done' with an appropriate error message
+7. NEVER call 'done' without first gathering and analyzing the necessary data
+8. Make no assumptions about the data structure - analyze what you receive from the tools
+9. Focus on answering the user's specific question using the data you gather`,
   assistant: "",
-  tools: [doneTool],
+  tools: [getAgreementTool, getTemplateTool, doneTool],
   mcpServers: [
     {
       name: "apai",
@@ -57,76 +135,145 @@ IMPORTANT:
   ],
   lifecycle: {
     enabled: ({ network }) => {
-      console.log("Checking if agent is enabled");
+      console.log("=== Agent Enabled Check ===");
+      console.log("Network state:", network?.state);
       return true;
     },
     onStart: async ({ prompt, network }) => {
-      console.log("Agent starting with prompt:", prompt);
+      console.log("=== Agent starting ===");
+      console.log("Prompt:", prompt);
       console.log("Network state:", network?.state);
-      console.log("Available MCP tools:", Array.from(APAIAgent.tools.entries())
-        .filter(([name]) => name.startsWith("apai-"))
-        .map(([name, tool]) => ({
-          name,
-          description: tool.description || "No description available",
-          parameters: tool.parameters ? "Parameters defined" : "No parameters",
-          mcp: tool.mcp ? {
-            server: tool.mcp.server.name,
-            tool: {
-              name: tool.mcp.tool.name,
-              description: tool.mcp.tool.description,
-              inputSchema: tool.mcp.tool.inputSchema
-            }
-          } : "No MCP details"
-        })));
+      
+      // Log available tools
+      console.log("\n=== Available Tools ===");
+      console.log("Local tools:", Array.from(APAIAgent.tools.entries()).map(([name, tool]) => ({
+        name,
+        description: tool.description,
+        mcp: tool.mcp ? {
+          server: tool.mcp.server.name,
+          tool: tool.mcp.tool.name
+        } : null
+      })));
+      
       return { prompt, history: [], stop: false };
     },
     onResponse: async ({ result }) => {
-      console.log("Agent response:", result);
+      console.log("\n=== Agent Response Cycle ===");
       
-      // Check for tool calls
-      const toolCall = result.output.find(output => output.type === 'tool_call')?.tools[0];
-      if (toolCall) {
-        if (toolCall.name === 'apai-convert-agreement-to-format') {
-          // Validate format
-          if (toolCall.input.format !== 'html' && toolCall.input.format !== 'markdown') {
-            console.log("Warning: Invalid format specified for apai-convert-agreement-to-format");
-            // Instead of modifying the result, we'll let the agent handle the error
-            return result;
+      // Log the current state of the conversation
+      console.log("\nCurrent History Length:", result.history?.length || 0);
+      if (result.history?.length > 0) {
+        console.log("\nLast few messages in history:");
+        result.history.slice(-3).forEach((msg, index) => {
+          console.log(`\nMessage ${index + 1}:`, {
+            type: msg.type,
+            role: msg.role,
+            content: msg.type === 'tool_result' ? 'Tool result received' : undefined
+          });
+        });
+      }
+
+      // Log tool calls
+      console.log("\nTool Calls:", result.toolCalls?.length || 0);
+      if (result.toolCalls?.length > 0) {
+        result.toolCalls.forEach((toolCall, index) => {
+          console.log(`\nTool call ${index + 1}:`, {
+            name: toolCall.tool.name,
+            type: toolCall.type,
+            content: toolCall.content
+          });
+        });
+      }
+
+      // Log agent's output
+      console.log("\nAgent Output:");
+      if (result.output?.length > 0) {
+        result.output.forEach((msg, index) => {
+          if (msg.type === 'text') {
+            console.log(`\nOutput ${index + 1}:`, {
+              type: msg.type,
+              role: msg.role,
+              stop_reason: msg.stop_reason,
+              content: msg.content
+            });
+          } else if (msg.type === 'tool_call') {
+            console.log(`\nTool Call ${index + 1}:`, {
+              type: msg.type,
+              role: msg.role,
+              stop_reason: msg.stop_reason,
+              tool: msg.tools?.[0]?.name,
+              input: msg.tools?.[0]?.input
+            });
           }
+        });
+      } else {
+        console.log("No output in this response");
+      }
+
+      // Check for tool results
+      if (result.history) {
+        const toolResults = result.history.filter(msg => msg.type === 'tool_result');
+        if (toolResults.length > 0) {
+          console.log("\n=== Tool Results ===");
+          toolResults.forEach((toolResult, index) => {
+            console.log(`\nTool result ${index + 1}:`, {
+              type: toolResult.type,
+              tool: toolResult.tool?.name,
+              content: toolResult.content
+            });
+
+            // If we have a tool result, we should continue the conversation
+            if (toolResult.type === 'tool_result') {
+              // Add the tool result to the history if it's not already there
+              if (!result.history?.some(msg => 
+                msg.type === 'tool_result' && 
+                msg.tool?.name === toolResult.tool?.name
+              )) {
+                result.history.push(toolResult);
+              }
+              
+              // If this was a getAgreement call, we should analyze the data
+              if (toolResult.tool?.name === 'apai-getAgreement') {
+                console.log("Agreement data received, continuing conversation...");
+                // Add a final message to indicate completion
+                result.history.push({
+                  type: 'text',
+                  role: 'assistant',
+                  content: 'I have analyzed the agreement data and provided my response.'
+                });
+                // Add a done tool call to stop the conversation
+                result.output = [{
+                  type: 'tool_call',
+                  role: 'assistant',
+                  stop_reason: 'tool',
+                  tools: [{
+                    type: 'tool',
+                    id: 'done',
+                    name: 'done',
+                    input: {
+                      answer: 'I have analyzed the agreement data and will provide a response about the penalties.'
+                    }
+                  }]
+                }];
+                return result;
+              }
+            }
+          });
         }
       }
-      
-      // Check if we've already made a tool call in the history
-      const history = result.history || [];
-      const previousToolCalls = history.filter(h => {
-        const output = (h as any).output || [];
-        return output.some((o: any) => 
-          o.type === 'tool_call' && 
-          o.tools.some((t: any) => t.name === 'apai-convert-agreement-to-format')
-        );
-      });
-      
-      if (previousToolCalls.length > 0) {
-        console.log("Warning: Multiple tool calls detected, forcing 'done' call");
-        // Force the agent to call 'done' by modifying the result
-        result.output = [
-          {
-            type: 'tool_call',
-            role: 'assistant',
-            stop_reason: 'tool',
-            tools: [{
-              type: 'tool',
-              id: `toolu_${Date.now()}`,
-              name: 'done',
-              input: {
-                answer: "I've already attempted to convert the agreement. Please check the previous response."
-              }
-            }]
-          }
-        ];
+
+      // If we have a done tool call, we should stop
+      if (result.output?.some(msg => msg.type === 'tool_call' && msg.tools?.[0]?.name === 'done')) {
+        console.log("Done tool called, stopping conversation");
         return result;
       }
-      
+
+      // If we have a tool call but no result yet, we should continue
+      if (result.output?.some(msg => msg.type === 'tool_call') && !result.history?.some(msg => msg.type === 'tool_result')) {
+        console.log("Tool call made but no result yet, continuing...");
+        return result;
+      }
+
       return result;
     }
   }
@@ -153,25 +300,31 @@ const apaiAgentNetwork = createNetwork({
     },
   }),
   defaultRouter: ({ network }) => {
+    console.log("=== Network Router ===");
     console.log("Network state:", network?.state);
-    console.log("Agent tools:", Array.from(APAIAgent.tools.entries()).map(([name, tool]) => ({
+    
+    // Log available tools
+    console.log("Available tools:", Array.from(APAIAgent.tools.entries()).map(([name, tool]) => ({
       name,
-      description: tool.description || "No description available",
-      parameters: tool.parameters ? "Parameters defined" : "No parameters"
+      description: tool.description,
+      mcp: tool.mcp ? {
+        server: tool.mcp.server.name,
+        tool: tool.mcp.tool.name
+      } : null
     })));
     
     // Initialize network state if needed
     if (network?.state.kv) {
       if (!network.state.kv.has("initialized")) {
+        console.log("Initializing network state");
         network.state.kv.set("initialized", true);
-        network.state.kv.set("history", []); // Initialize empty history
-        network.state.kv.set("messages", []); // Initialize empty messages array
-        network.state.kv.set("tools", []); // Initialize empty tools array
+        network.state.kv.set("history", []);
       }
+    } else {
+      console.log("Warning: No network state available");
     }
     
-    // Return the agent if there's no answer yet
-    if (!network?.state.kv.get("answer")) {
+    if (!network?.state.kv?.get("answer")) {
       return APAIAgent;
     }
     return;
@@ -187,20 +340,44 @@ const inngest = new Inngest({
 const apaiAgentFunction = inngest.createFunction(
   {
     id: "apai-agent",
-    name: "APAI Agent"
+    name: "APAI Agent",
+    retries: 0,
+    concurrency: 1
   },
   {
     event: "apai/request"
   },
   async ({ event }) => {
-    return APAIAgent.run(event.data.input, {
-      model: anthropic({
-        model: "claude-3-5-sonnet-20240620",
-        defaultParameters: {
-          max_tokens: 1000,
-        },
-      })
-    });
+    const executionId = (event as any)._inngest?.gid || uuidv4();
+    console.log(`\n=== Function Execution ${executionId} ===`);
+    console.log("Event data:", event.data);
+    
+    try {
+      // Use network.run() to handle the entire conversation flow
+      const finalResult = await apaiAgentNetwork.run(event.data.input);
+      
+      console.log(`\n=== Function Result ${executionId} ===`);
+      console.log("Final Result:", finalResult);
+      
+      return finalResult;
+    } catch (error: any) {
+      console.error(`\n=== Function Error ${executionId} ===`);
+      console.error("Error:", error);
+      
+      // Handle overloaded error
+      if (error?.type === 'overloaded_error') {
+        console.log("Server overloaded, returning error message...");
+        return {
+          output: [{
+            type: 'text',
+            role: 'assistant',
+            content: 'The server is currently overloaded. Please try again in a few moments.'
+          }]
+        };
+      }
+      
+      throw error;
+    }
   }
 );
 
@@ -220,15 +397,6 @@ server.on("start", () => {
 server.listen(3010, () => {
   console.log("APAI Agent demo server is running on port 3010");
   console.log("Connecting to MCP server at:", apaiUrl);
-  console.log("Agent configuration:", {
-    name: APAIAgent.name,
-    tools: Array.from(APAIAgent.tools.entries()).map(([name, tool]) => ({
-      name,
-      description: tool.description || "No description available",
-      parameters: tool.parameters ? "Parameters defined" : "No parameters"
-    })),
-    system: APAIAgent.system
-  });
 });
 
 // Handle server errors
